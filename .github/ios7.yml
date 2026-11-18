@@ -1,0 +1,999 @@
+name: Build nullDC iOS 7 (armv7) - self-contained
+# Put ONLY this file at .github/workflows/ios7.yml in your nulldce-psp repo (original sources).
+# It writes every iOS file, patches the PSP sources, builds .ipa/.deb with Theos.
+# Run: Actions -> "Build nullDC iOS 7 (armv7) - self-contained" -> Run workflow.
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write iOS files and patch sources
+        run: |
+          set -euo pipefail
+          mkdir -p ios/include Resources
+          cat > 'ios/ios_host.h' <<'EOF_NDC'
+          /*
+          	Host <-> core bridge for the iOS 7 (armv7) port.
+          	Plain C so that both the Objective-C++ host (ios/main.mm, which must NOT include
+          	core headers: config.h poisons BIG_ENDIAN/LITTLE_ENDIAN) and the core can use it.
+          */
+          #pragma once
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          /* ---- implemented by ios/main.mm (host) ---- */
+          int   ios_gl_init(void);                 /* emu thread: EAGLContext + renderbuffer on the CAEAGLLayer */
+          void  ios_gl_present(void);              /* emu thread: present + 60 fps limiter                      */
+          void  ios_audio_init(void);              /* AudioQueue, 44100 Hz s16 stereo                           */
+          void  ios_audio_write(short a, short b); /* one stereo frame, called ~44100x/s from the emu thread    */
+          void  ios_input_poll(unsigned short* kcode, unsigned char* lt, unsigned char* rt);
+          void  ios_alert(const char* text);
+
+          /* ---- implemented by ios/ios_os.cpp (core side) ---- */
+          void  ios_set_disc(const char* path);    /* "" -> boot the Dreamcast BIOS without a disc */
+          int   ios_emu_main(void);                /* blocking; runs EmuMain()                      */
+
+          #ifdef __cplusplus
+          }
+          #endif
+          EOF_NDC
+          cat > 'ios/ios_compat.h' <<'EOF_NDC'
+          /*
+          	Force-included (-include) into every translation unit of the iOS build.
+          	Gives the few PSP SDK calls that still live in shared core code a harmless meaning.
+          */
+          #pragma once
+          #include <stdint.h>
+          #include <string.h>
+          #include <strings.h>
+          #define stricmp  strcasecmp
+          #define strnicmp strncasecmp
+
+          /* PSP "uncached alias" of a variable -> just the variable (no ME coprocessor here) */
+          #define PSP_UC(var) (var)
+
+          static inline void  sceKernelDcacheWritebackInvalidateAll(void) { }
+          static inline void* sceDmacMemcpy(void* d, const void* s, unsigned n) { return memcpy(d, s, n); }
+          EOF_NDC
+          cat > 'ios/ios_os.cpp' <<'EOF_NDC'
+          /*
+          	Core-side OS glue for iOS (replaces psp/main.cpp). Compiled WITH core headers.
+          */
+          #include "types.h"
+          #include "os_base.h"
+          #include "stdclass.h"
+          #include "ios/ios_host.h"
+          #include <mach/mach_time.h>
+
+          //normally defined by the dynarec driver (excluded in interpreter-only builds); read by SPG.cpp for the fps text
+          u32 dynarecIdle = 2;
+
+          static char g_disc[1024];
+
+          extern int EmuMain(int argc, wchar* argv[]);
+
+          extern "C" void ios_set_disc(const char* path)
+          {
+          	strncpy(g_disc, path ? path : "", sizeof(g_disc) - 1);
+          	g_disc[sizeof(g_disc) - 1] = 0;
+          }
+
+          extern "C" int ios_emu_main(void)
+          {
+          	static char name[] = "nulldc";
+          	char* argv[2] = { name, 0 };
+          	return EmuMain(1, argv);
+          }
+
+          //returns: 1 = image selected (path in szFileName), 0 = no disc (boot BIOS), -1 = cancel
+          int os_GetFile(char* szFileName, char* szParse, u32 flags)
+          {
+          	if (g_disc[0] == 0)
+          		return 0;
+          	strcpy(szFileName, g_disc);
+          	printf("Selected %s\n", szFileName);
+          	return 1;
+          }
+
+          int os_msgbox(const wchar* text, unsigned int type)
+          {
+          	printf("OS_MSGBOX: %s\n", text);
+          	ios_alert(text);
+          	return 0;
+          }
+
+          double os_GetSeconds()	//milliseconds, like the PSP version
+          {
+          	static mach_timebase_info_data_t tb;
+          	if (tb.denom == 0) mach_timebase_info(&tb);
+          	return (double)mach_absolute_time() * tb.numer / tb.denom / 1.0e6;
+          }
+
+          //threaded.cpp spinlock helpers (psp/dc/sh4/rec_v2/fast_access.s on PSP)
+          extern "C" void test_and_set(u32* m)  { while (__sync_lock_test_and_set(m, 1)) { } }
+          extern "C" void unlock_mutx(u32* m)   { __sync_lock_release(m); }
+
+          //defined by nullRend.cpp (PSP GU renderer) upstream; regs.cpp sets it on palette writes
+          bool pal_needs_update = true;
+          EOF_NDC
+          cat > 'ios/ngen_stub.cpp' <<'EOF_NDC'
+          /*
+          	Interpreter-only build: rec_v2 still compiles its SHIL "canonical" op tables, which reference the
+          	ngen_CC_* callback emitters of a dynarec backend. There is no ARM backend yet (only the PSP/MIPS one),
+          	and the recompiler is never selected (HOST_NO_REC), so these are never executed.
+          */
+          #include "types.h"
+          #include "dc/sh4/rec_v2/ngen.h"
+
+          void ngen_CC_Start(shil_opcode* op) { }
+          void ngen_CC_Param(shil_opcode* op, shil_param* par, CanonicalParamType tp) { }
+          void ngen_CC_Call(shil_opcode* op, void* function) { }
+          void ngen_CC_Finish(shil_opcode* op) { }
+          EOF_NDC
+          cat > 'ios/main.mm' <<'EOF_NDC'
+          // nullDC-iOS7 host (armv7, iOS 7.0+, Objective-C++, manual retain/release NOT used: ARC is
+          // available from iOS 5 so this file is compiled with -fobjc-arc).
+          //
+          // DO NOT include core headers here: config.h poisons BIG_ENDIAN/LITTLE_ENDIAN and breaks
+          // system headers. Talk to the core only through ios/ios_host.h.
+          //
+          // Layout of the touch pad, "slide the thumb across the d-pad" and "touch between two face
+          // buttons = both pressed" are taken from CrashBandicoot.IosHost/TouchControllerView.cs.
+          // The ring-buffer audio push model follows IosAudioOutput.cs (CoreAudio is pull based, the
+          // emulator pushes samples).
+
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <OpenGLES/EAGL.h>
+          #import <OpenGLES/ES2/gl.h>
+          #import <OpenGLES/ES2/glext.h>
+          #import <AudioToolbox/AudioToolbox.h>
+          #import <AVFoundation/AVFoundation.h>
+          #include <mach/mach_time.h>
+          #include <unistd.h>
+          #include <dirent.h>
+          #include <sys/stat.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include "ios/ios_host.h"
+
+          // ---------------------------------------------------------------------------------------
+          // Shared state
+          // ---------------------------------------------------------------------------------------
+          static CAEAGLLayer*      g_layer   = nil;
+          static EAGLContext*      g_ctx     = nil;
+          static GLuint            g_fbo = 0, g_crb = 0, g_drb = 0;
+          static GLint             g_w = 0, g_h = 0;
+          static volatile bool     g_active  = true;       // app in foreground? (GL is forbidden in background)
+          static AudioQueueRef     g_queue   = NULL;
+
+          // Dreamcast key bits, identical to key_CONT_* in drkMapleDevices.cpp (here: active-high)
+          enum {
+          	K_C = 1 << 0, K_B = 1 << 1, K_A = 1 << 2, K_START = 1 << 3,
+          	K_UP = 1 << 4, K_DOWN = 1 << 5, K_LEFT = 1 << 6, K_RIGHT = 1 << 7,
+          	K_Z = 1 << 8, K_Y = 1 << 9, K_X = 1 << 10, K_D = 1 << 11,
+          	K_LT = 1 << 16, K_RT = 1 << 17
+          };
+          static volatile uint32_t g_pad = 0;
+
+          static NSString* DocumentsDir(void)
+          {
+          	return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+          }
+
+          // ---------------------------------------------------------------------------------------
+          // Input bridge
+          // ---------------------------------------------------------------------------------------
+          void ios_input_poll(unsigned short* kcode, unsigned char* lt, unsigned char* rt)
+          {
+          	uint32_t p = g_pad;
+          	*kcode = (unsigned short)(~p & 0xFFFF);          // Dreamcast buttons are active-low
+          	*lt = (p & K_LT) ? 255 : 0;
+          	*rt = (p & K_RT) ? 255 : 0;
+          }
+
+          void ios_alert(const char* text)
+          {
+          	NSString* s = [NSString stringWithUTF8String:text ? text : ""];
+          	dispatch_async(dispatch_get_main_queue(), ^{
+          		NSLog(@"[nullDC] %@", s);
+          	});
+          }
+
+          // ---------------------------------------------------------------------------------------
+          // Audio: emulator pushes frames into a lock-free SPSC ring, AudioQueue pulls
+          // ---------------------------------------------------------------------------------------
+          #define RING_FRAMES 16384u                              // power of two
+          #define RING_MASK   (RING_FRAMES - 1u)
+          static int16_t           g_ring[RING_FRAMES * 2];
+          static volatile uint32_t g_wr = 0, g_rd = 0;
+
+          void ios_audio_write(short a, short b)
+          {
+          	uint32_t w = g_wr;
+          	if (w - g_rd >= RING_FRAMES) return;                // full: drop (emulator slower than realtime is fine)
+          	g_ring[(w & RING_MASK) * 2]     = a;
+          	g_ring[(w & RING_MASK) * 2 + 1] = b;
+          	__sync_synchronize();
+          	g_wr = w + 1;
+          }
+
+          static void AudioPull(void* ctx, AudioQueueRef q, AudioQueueBufferRef buf)
+          {
+          	int16_t* out    = (int16_t*)buf->mAudioData;
+          	UInt32   frames = buf->mAudioDataBytesCapacity / 4;
+          	uint32_t r = g_rd, w = g_wr;
+          	__sync_synchronize();
+          	for (UInt32 i = 0; i < frames; i++)
+          	{
+          		if (r != w) { out[i * 2] = g_ring[(r & RING_MASK) * 2]; out[i * 2 + 1] = g_ring[(r & RING_MASK) * 2 + 1]; r++; }
+          		else        { out[i * 2] = 0; out[i * 2 + 1] = 0; }
+          	}
+          	g_rd = r;
+          	buf->mAudioDataByteSize = frames * 4;
+          	AudioQueueEnqueueBuffer(q, buf, 0, NULL);
+          }
+
+          void ios_audio_init(void)
+          {
+          	if (g_queue) return;
+          	NSError* err = nil;
+          	AVAudioSession* s = [AVAudioSession sharedInstance];
+          	[s setCategory:AVAudioSessionCategoryAmbient error:&err];
+          	[s setActive:YES error:&err];
+
+          	AudioStreamBasicDescription f = {0};
+          	f.mSampleRate       = 44100.0;
+          	f.mFormatID         = kAudioFormatLinearPCM;
+          	f.mFormatFlags      = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
+          	f.mBitsPerChannel   = 16;
+          	f.mChannelsPerFrame = 2;
+          	f.mBytesPerFrame    = 4;
+          	f.mFramesPerPacket  = 1;
+          	f.mBytesPerPacket   = 4;
+          	if (AudioQueueNewOutput(&f, AudioPull, NULL, NULL, NULL, 0, &g_queue) != noErr) { g_queue = NULL; return; }
+          	for (int i = 0; i < 3; i++)
+          	{
+          		AudioQueueBufferRef b;
+          		AudioQueueAllocateBuffer(g_queue, 1024 * 4, &b);
+          		b->mAudioDataByteSize = 1024 * 4;
+          		memset(b->mAudioData, 0, 1024 * 4);
+          		AudioQueueEnqueueBuffer(g_queue, b, 0, NULL);
+          	}
+          	AudioQueueStart(g_queue, NULL);
+          }
+
+          // ---------------------------------------------------------------------------------------
+          // GL: context lives on the emulation thread (the renderer issues all GL calls from there)
+          // ---------------------------------------------------------------------------------------
+          static GLint g_vx, g_vy, g_vw, g_vh;
+
+          int ios_gl_init(void)
+          {
+          	@autoreleasepool {
+          		if (!g_layer) return 0;
+          		g_ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+          		if (!g_ctx || ![EAGLContext setCurrentContext:g_ctx]) return 0;
+
+          		glGenFramebuffers(1, &g_fbo);
+          		glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+
+          		glGenRenderbuffers(1, &g_crb);
+          		glBindRenderbuffer(GL_RENDERBUFFER, g_crb);
+          		if (![g_ctx renderbufferStorage:GL_RENDERBUFFER fromDrawable:g_layer]) return 0;
+          		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, g_crb);
+          		glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH,  &g_w);
+          		glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &g_h);
+
+          		glGenRenderbuffers(1, &g_drb);
+          		glBindRenderbuffer(GL_RENDERBUFFER, g_drb);
+          		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, g_w, g_h);
+          		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_drb);
+
+          		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return 0;
+
+          		// 4:3 letterbox, centred
+          		g_vh = g_h; g_vw = (g_h * 4) / 3;
+          		if (g_vw > g_w) { g_vw = g_w; g_vh = (g_w * 3) / 4; }
+          		g_vx = (g_w - g_vw) / 2; g_vy = (g_h - g_vh) / 2;
+          		glViewport(g_vx, g_vy, g_vw, g_vh);
+          		return 1;
+          	}
+          }
+
+          void ios_gl_present(void)
+          {
+          	@autoreleasepool {
+          		// iOS kills apps that touch GL in the background: finish and park the emu thread.
+          		if (!g_active) { glFinish(); while (!g_active) usleep(20000); }
+
+          		glBindRenderbuffer(GL_RENDERBUFFER, g_crb);
+          		[g_ctx presentRenderbuffer:GL_RENDERBUFFER];
+          		glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+          		glViewport(g_vx, g_vy, g_vw, g_vh);
+
+          		// 60 fps limiter (presentRenderbuffer does not block)
+          		static mach_timebase_info_data_t tb; static uint64_t last = 0;
+          		if (tb.denom == 0) mach_timebase_info(&tb);
+          		const uint64_t frame = (uint64_t)(1.0e9 / 60.0) * tb.denom / tb.numer;
+          		uint64_t now = mach_absolute_time();
+          		if (last && now - last < frame)
+          		{
+          			uint64_t ns = (frame - (now - last)) * tb.numer / tb.denom;
+          			usleep((useconds_t)(ns / 1000));
+          			now = mach_absolute_time();
+          		}
+          		last = now;
+          	}
+          }
+
+          // ---------------------------------------------------------------------------------------
+          // Views
+          // ---------------------------------------------------------------------------------------
+          @interface NDCGLView : UIView
+          @end
+          @implementation NDCGLView
+          + (Class)layerClass { return [CAEAGLLayer class]; }
+          - (instancetype)initWithFrame:(CGRect)f
+          {
+          	if ((self = [super initWithFrame:f]))
+          	{
+          		self.opaque = YES;
+          		self.multipleTouchEnabled = NO;
+          		self.userInteractionEnabled = NO;
+          		self.contentScaleFactor = [UIScreen mainScreen].scale;
+          		CAEAGLLayer* l = (CAEAGLLayer*)self.layer;
+          		l.opaque = YES;
+          		l.drawableProperties = @{ kEAGLDrawablePropertyRetainedBacking : @NO,
+          		                          kEAGLDrawablePropertyColorFormat : kEAGLColorFormatRGBA8 };
+          		g_layer = l;
+          	}
+          	return self;
+          }
+          @end
+
+          @interface NDCPadView : UIView
+          @end
+          @implementation NDCPadView
+          {
+          	CGPoint _dpadC; CGFloat _dpadR;
+          	CGPoint _faceC; CGFloat _faceBtnR, _faceOff;
+          	CGRect  _rectL, _rectR, _rectStart;
+          	uint32_t _state;
+          }
+          - (instancetype)initWithFrame:(CGRect)f
+          {
+          	if ((self = [super initWithFrame:f]))
+          	{
+          		self.backgroundColor = [UIColor clearColor];
+          		self.opaque = NO;
+          		self.multipleTouchEnabled = YES;
+          		self.contentMode = UIViewContentModeRedraw;
+          	}
+          	return self;
+          }
+          - (void)layoutSubviews
+          {
+          	[super layoutSubviews];
+          	CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+          	CGFloat m = 18;
+          	CGFloat cluster = MAX(110, MIN(170, MIN(w, h) * 0.42));
+          	_dpadR   = cluster / 2;
+          	_dpadC   = CGPointMake(m + _dpadR, h - m - _dpadR);
+          	_faceBtnR = cluster * 0.19;
+          	_faceOff  = cluster * 0.32;
+          	_faceC   = CGPointMake(w - m - cluster / 2, h - m - cluster / 2);
+          	_rectL   = CGRectMake(m, 10, 78, 34);
+          	_rectR   = CGRectMake(w - m - 78, 10, 78, 34);
+          	_rectStart = CGRectMake(w / 2 - 40, h - m - 26, 80, 26);
+          }
+          - (CGPoint)faceCenter:(uint32_t)bit
+          {
+          	switch (bit) {
+          		case K_A: return CGPointMake(_faceC.x, _faceC.y + _faceOff);   // bottom
+          		case K_B: return CGPointMake(_faceC.x + _faceOff, _faceC.y);   // right
+          		case K_X: return CGPointMake(_faceC.x - _faceOff, _faceC.y);   // left
+          		default:  return CGPointMake(_faceC.x, _faceC.y - _faceOff);   // Y: top
+          	}
+          }
+          - (uint32_t)bitsForPoint:(CGPoint)p
+          {
+          	uint32_t b = 0;
+          	// d-pad: 8-way, slide your thumb across it
+          	CGFloat dx = p.x - _dpadC.x, dy = p.y - _dpadC.y, d = hypot(dx, dy);
+          	if (d < _dpadR * 1.25 && d > _dpadR * 0.10)
+          	{
+          		CGFloat dz = _dpadR * 0.28;
+          		if (dx >  dz) b |= K_RIGHT;
+          		if (dx < -dz) b |= K_LEFT;
+          		if (dy >  dz) b |= K_DOWN;
+          		if (dy < -dz) b |= K_UP;
+          	}
+          	// face buttons: generous radius so a touch between two presses both
+          	static const uint32_t face[4] = { K_A, K_B, K_X, K_Y };
+          	for (int i = 0; i < 4; i++)
+          	{
+          		CGPoint c = [self faceCenter:face[i]];
+          		if (hypot(p.x - c.x, p.y - c.y) <= _faceBtnR * 1.35) b |= face[i];
+          	}
+          	if (CGRectContainsPoint(CGRectInset(_rectL, -10, -10), p))     b |= K_LT;
+          	if (CGRectContainsPoint(CGRectInset(_rectR, -10, -10), p))     b |= K_RT;
+          	if (CGRectContainsPoint(CGRectInset(_rectStart, -10, -10), p)) b |= K_START;
+          	return b;
+          }
+          - (void)recompute:(UIEvent*)event
+          {
+          	uint32_t s = 0;
+          	for (UITouch* t in [event touchesForView:self])
+          		if (t.phase != UITouchPhaseEnded && t.phase != UITouchPhaseCancelled)
+          			s |= [self bitsForPoint:[t locationInView:self]];
+          	if (s != _state) { _state = s; g_pad = s; [self setNeedsDisplay]; }   // redraw only on change
+          }
+          - (void)touchesBegan:(NSSet*)t withEvent:(UIEvent*)e     { [self recompute:e]; }
+          - (void)touchesMoved:(NSSet*)t withEvent:(UIEvent*)e     { [self recompute:e]; }
+          - (void)touchesEnded:(NSSet*)t withEvent:(UIEvent*)e     { [self recompute:e]; }
+          - (void)touchesCancelled:(NSSet*)t withEvent:(UIEvent*)e { [self recompute:e]; }
+
+          - (void)drawLabel:(NSString*)s in:(CGRect)r size:(CGFloat)sz
+          {
+          	NSMutableParagraphStyle* ps = [[NSMutableParagraphStyle alloc] init];
+          	ps.alignment = NSTextAlignmentCenter;
+          	NSDictionary* a = @{ NSFontAttributeName : [UIFont boldSystemFontOfSize:sz],
+          	                     NSForegroundColorAttributeName : [UIColor colorWithWhite:1 alpha:0.85],
+          	                     NSParagraphStyleAttributeName : ps };
+          	CGSize ts = [s sizeWithAttributes:a];
+          	[s drawInRect:CGRectMake(r.origin.x, r.origin.y + (r.size.height - ts.height) / 2, r.size.width, ts.height) withAttributes:a];
+          }
+          - (void)drawRect:(CGRect)rect
+          {
+          	CGContextRef c = UIGraphicsGetCurrentContext();
+          	UIColor* idle = [UIColor colorWithWhite:1 alpha:0.14];
+          	UIColor* down = [UIColor colorWithWhite:1 alpha:0.42];
+          	UIColor* line = [UIColor colorWithWhite:1 alpha:0.40];
+
+          	// d-pad (plus shape)
+          	CGFloat arm = _dpadR * 0.66, len = _dpadR;
+          	struct { CGRect r; uint32_t bit; } arms[4] = {
+          		{ CGRectMake(_dpadC.x - arm / 2, _dpadC.y - len, arm, len - arm / 2), K_UP },
+          		{ CGRectMake(_dpadC.x - arm / 2, _dpadC.y + arm / 2, arm, len - arm / 2), K_DOWN },
+          		{ CGRectMake(_dpadC.x - len, _dpadC.y - arm / 2, len - arm / 2, arm), K_LEFT },
+          		{ CGRectMake(_dpadC.x + arm / 2, _dpadC.y - arm / 2, len - arm / 2, arm), K_RIGHT } };
+          	for (int i = 0; i < 4; i++)
+          	{
+          		CGContextSetFillColorWithColor(c, (_state & arms[i].bit) ? down.CGColor : idle.CGColor);
+          		CGContextFillRect(c, arms[i].r);
+          		CGContextSetStrokeColorWithColor(c, line.CGColor);
+          		CGContextStrokeRect(c, arms[i].r);
+          	}
+          	// face buttons
+          	static const uint32_t face[4] = { K_A, K_B, K_X, K_Y };
+          	static NSString* const names[4] = { @"A", @"B", @"X", @"Y" };
+          	for (int i = 0; i < 4; i++)
+          	{
+          		CGPoint p = [self faceCenter:face[i]];
+          		CGRect r = CGRectMake(p.x - _faceBtnR, p.y - _faceBtnR, _faceBtnR * 2, _faceBtnR * 2);
+          		CGContextSetFillColorWithColor(c, (_state & face[i]) ? down.CGColor : idle.CGColor);
+          		CGContextFillEllipseInRect(c, r);
+          		CGContextSetStrokeColorWithColor(c, line.CGColor);
+          		CGContextStrokeEllipseInRect(c, r);
+          		[self drawLabel:names[i] in:r size:16];
+          	}
+          	// triggers + start
+          	struct { CGRect r; uint32_t bit; NSString* s; } pills[3] = {
+          		{ _rectL, K_LT, @"L" }, { _rectR, K_RT, @"R" }, { _rectStart, K_START, @"START" } };
+          	for (int i = 0; i < 3; i++)
+          	{
+          		UIBezierPath* p = [UIBezierPath bezierPathWithRoundedRect:pills[i].r cornerRadius:pills[i].r.size.height / 2];
+          		[((_state & pills[i].bit) ? down : idle) setFill]; [p fill];
+          		[line setStroke]; [p stroke];
+          		[self drawLabel:pills[i].s in:pills[i].r size:11];
+          	}
+          }
+          @end
+
+          // ---------------------------------------------------------------------------------------
+          // Game screen
+          // ---------------------------------------------------------------------------------------
+          @interface NDCGameVC : UIViewController
+          - (instancetype)initWithDisc:(NSString*)disc;
+          @end
+          @implementation NDCGameVC
+          {
+          	NSString* _disc;
+          }
+          - (instancetype)initWithDisc:(NSString*)disc
+          {
+          	if ((self = [super init])) _disc = [disc copy];
+          	return self;
+          }
+          - (BOOL)prefersStatusBarHidden { return YES; }
+          - (BOOL)shouldAutorotate { return YES; }
+          - (NSUInteger)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+          - (void)loadView
+          {
+          	CGRect b = [UIScreen mainScreen].bounds;
+          	if (b.size.width < b.size.height) b = CGRectMake(0, 0, b.size.height, b.size.width);
+          	UIView* root = [[UIView alloc] initWithFrame:b];
+          	root.backgroundColor = [UIColor blackColor];
+          	NDCGLView* gl = [[NDCGLView alloc] initWithFrame:root.bounds];
+          	gl.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+          	[root addSubview:gl];
+          	NDCPadView* pad = [[NDCPadView alloc] initWithFrame:root.bounds];
+          	pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+          	[root addSubview:pad];
+          	self.view = root;
+          }
+          - (void)viewDidAppear:(BOOL)animated
+          {
+          	[super viewDidAppear:animated];
+          	static BOOL started = NO;
+          	if (started) return;
+          	started = YES;
+          	ios_set_disc(_disc ? _disc.UTF8String : "");
+          	NSThread* t = [[NSThread alloc] initWithTarget:self selector:@selector(emuMain) object:nil];
+          	t.stackSize = 16 * 1024 * 1024;               // interpreter + recursive decoder need headroom
+          	t.name = @"nulldc-emu";
+          	[t start];
+          }
+          - (void)emuMain
+          {
+          	@autoreleasepool { chdir(DocumentsDir().fileSystemRepresentation); }   // core uses ./data, ./nullDC.cfg
+          	ios_emu_main();
+          }
+          @end
+
+          // ---------------------------------------------------------------------------------------
+          // Game picker (iTunes file sharing: Documents/data/dc_boot.bin, dc_flash.bin, Documents/discs/...)
+          // ---------------------------------------------------------------------------------------
+          static void ScanDiscs(NSString* dir, NSMutableArray* out, int depth)
+          {
+          	NSFileManager* fm = [NSFileManager defaultManager];
+          	for (NSString* n in [fm contentsOfDirectoryAtPath:dir error:nil])
+          	{
+          		NSString* p = [dir stringByAppendingPathComponent:n];
+          		BOOL isDir = NO;
+          		if (![fm fileExistsAtPath:p isDirectory:&isDir]) continue;
+          		if (isDir) { if (depth < 3) ScanDiscs(p, out, depth + 1); continue; }
+          		NSString* e = [[n pathExtension] lowercaseString];
+          		if ([@[ @"gdi", @"cdi", @"chd", @"cue", @"mds", @"nrg" ] containsObject:e]) [out addObject:p];
+          	}
+          }
+
+          @interface NDCPickerVC : UITableViewController
+          @end
+          @implementation NDCPickerVC
+          {
+          	NSMutableArray* _discs;
+          	BOOL _haveBios;
+          }
+          - (void)reload
+          {
+          	NSString* d = DocumentsDir();
+          	NSFileManager* fm = [NSFileManager defaultManager];
+          	_haveBios = [fm fileExistsAtPath:[d stringByAppendingPathComponent:@"data/dc_boot.bin"]] &&
+          	            [fm fileExistsAtPath:[d stringByAppendingPathComponent:@"data/dc_flash.bin"]];
+          	_discs = [NSMutableArray array];
+          	ScanDiscs([d stringByAppendingPathComponent:@"discs"], _discs, 0);
+          	[self.tableView reloadData];
+          }
+          - (void)viewDidLoad
+          {
+          	[super viewDidLoad];
+          	self.title = @"nullDC iOS 7";
+          	[[NSFileManager defaultManager] createDirectoryAtPath:[DocumentsDir() stringByAppendingPathComponent:@"data"] withIntermediateDirectories:YES attributes:nil error:nil];
+          	[[NSFileManager defaultManager] createDirectoryAtPath:[DocumentsDir() stringByAppendingPathComponent:@"discs"] withIntermediateDirectories:YES attributes:nil error:nil];
+          	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(reload)];
+          	[self reload];
+          }
+          - (NSUInteger)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+          - (NSInteger)numberOfSectionsInTableView:(UITableView*)t { return 1; }
+          - (NSInteger)tableView:(UITableView*)t numberOfRowsInSection:(NSInteger)s { return 1 + (NSInteger)_discs.count; }
+          - (NSString*)tableView:(UITableView*)t titleForFooterInSection:(NSInteger)s
+          {
+          	return _haveBios ? @"Put discs in Documents/discs via iTunes file sharing."
+          	                 : @"Missing Documents/data/dc_boot.bin and dc_flash.bin (copy them via iTunes file sharing).";
+          }
+          - (UITableViewCell*)tableView:(UITableView*)t cellForRowAtIndexPath:(NSIndexPath*)ip
+          {
+          	UITableViewCell* c = [t dequeueReusableCellWithIdentifier:@"c"];
+          	if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"c"];
+          	c.textLabel.text = ip.row == 0 ? @"Boot Dreamcast BIOS (no disc)" : [_discs[ip.row - 1] lastPathComponent];
+          	c.textLabel.font = [UIFont systemFontOfSize:15];
+          	return c;
+          }
+          - (void)tableView:(UITableView*)t didSelectRowAtIndexPath:(NSIndexPath*)ip
+          {
+          	if (!_haveBios) { [t deselectRowAtIndexPath:ip animated:YES]; return; }
+          	NSString* disc = ip.row == 0 ? nil : _discs[ip.row - 1];
+          	NDCGameVC* g = [[NDCGameVC alloc] initWithDisc:disc];
+          	[self presentViewController:g animated:NO completion:nil];
+          }
+          @end
+
+          // ---------------------------------------------------------------------------------------
+          // App
+          // ---------------------------------------------------------------------------------------
+          @interface NDCAppDelegate : UIResponder <UIApplicationDelegate>
+          @property (strong, nonatomic) UIWindow* window;
+          @end
+          @implementation NDCAppDelegate
+          - (BOOL)application:(UIApplication*)a didFinishLaunchingWithOptions:(NSDictionary*)o
+          {
+          	self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+          	self.window.rootViewController = [[UINavigationController alloc] initWithRootViewController:[[NDCPickerVC alloc] initWithStyle:UITableViewStyleGrouped]];
+          	[self.window makeKeyAndVisible];
+          	return YES;
+          }
+          - (void)applicationWillResignActive:(UIApplication*)a { g_active = false; if (g_queue) AudioQueuePause(g_queue); }
+          - (void)applicationDidBecomeActive:(UIApplication*)a   { g_active = true;  if (g_queue) AudioQueueStart(g_queue, NULL); }
+          @end
+
+          int main(int argc, char* argv[])
+          {
+          	@autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass([NDCAppDelegate class])); }
+          }
+          EOF_NDC
+          cat > 'ios/include/psprtc.h' <<'EOF_NDC'
+          /* iOS replacement for <psprtc.h>: only what SPG.cpp uses. Resolution = 1 MHz. */
+          #pragma once
+          #include <stdint.h>
+          #include <sys/time.h>
+          static inline uint32_t sceRtcGetTickResolution(void) { return 1000000u; }
+          static inline int sceRtcGetCurrentTick(uint64_t* t)
+          {
+          	struct timeval tv; gettimeofday(&tv, 0);
+          	*t = (uint64_t)tv.tv_sec * 1000000ull + (uint64_t)tv.tv_usec;
+          	return 0;
+          }
+          EOF_NDC
+          cat > 'ios/include/me.h' <<'EOF_NDC'
+          #pragma once
+          /* iOS stand-in for the PSP Media Engine header: the ME offload in aica_if.cpp is commented out upstream */
+          EOF_NDC
+          cat > 'ios/entitlements.plist' <<'EOF_NDC'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<!-- jailbroken devices only: lets a future JIT backend map executable memory -->
+          	<key>dynamic-codesigning</key><true/>
+          	<key>platform-application</key><true/>
+          </dict>
+          </plist>
+          EOF_NDC
+          cat > 'Makefile' <<'EOF_NDC'
+          # nullDC for iOS 7.0+ (armv7, 32-bit). Built with Theos + iPhoneOS9.3 SDK (same toolchain
+          # setup as the CrashBandicoot-iOS "ios-armv7-native" job, see .github/workflows/ios7-armv7.yml).
+          #
+          #   make package FINALPACKAGE=1        -> packages/*.deb (jailbroken) and .theos/obj/.../NullDCiOS7.app
+          #
+          # Interpreter-only: stock iOS 7 gives no executable memory, and rec_v2 has no ARM backend yet
+          # (only the PSP/MIPS one in psp/dc/sh4/rec_v2). See IOS7_PORT.md.
+          export ARCHS = armv7
+          export TARGET = iphone:clang:9.3:7.0
+          INSTALL_TARGET_PROCESSES = NullDCiOS7
+
+          include $(THEOS)/makefiles/common.mk
+          include ios/sources.mk
+
+          APPLICATION_NAME = NullDCiOS7
+          NullDCiOS7_FILES = $(NDC_SOURCES)
+
+          NDC_DEFS = -D_IOS -DRELEASE -DNO_MMU_TRACE
+          NullDCiOS7_CFLAGS   = $(NDC_DEFS) -I. -Iios -Iios/include -include ios/ios_compat.h \
+                                -O3 -fno-strict-aliasing -fno-exceptions -fno-rtti -mfpu=neon -fno-modules -stdlib=libc++ -nostdinc++ -isystem $(SDKINC) -w
+          # Toolchain is clang 19 whose bundled libc++ lacks __config_site and forces clang modules:
+          # use the iOS 9.3 SDK's own libc++ headers (matches the libc++.dylib on iOS 7) and no modules.
+          SDKINC = $(THEOS)/sdks/iPhoneOS9.3.sdk/usr/include/c++/v1
+          NullDCiOS7_USE_MODULES = 0
+          NullDCiOS7_CXXFLAGS = -std=gnu++11 -stdlib=libc++ -nostdinc++ -isystem $(SDKINC) -fno-modules -fno-cxx-modules -fno-exceptions -fno-rtti
+          NullDCiOS7_OBJCFLAGS   = -fobjc-arc
+          NullDCiOS7_OBJCCFLAGS  = -fobjc-arc -std=gnu++11 -stdlib=libc++ -nostdinc++ -isystem $(SDKINC) -fno-modules -fno-cxx-modules
+          NullDCiOS7_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore OpenGLES AudioToolbox AVFoundation
+          NullDCiOS7_LDFLAGS    = -lz -stdlib=libc++
+          NullDCiOS7_CODESIGN_FLAGS = -Sios/entitlements.plist
+
+          include $(THEOS_MAKE_PATH)/application.mk
+          EOF_NDC
+          cat > 'Resources/Info.plist' <<'EOF_NDC'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleDisplayName</key><string>nullDC</string>
+          	<key>CFBundleName</key><string>NullDCiOS7</string>
+          	<key>CFBundleExecutable</key><string>NullDCiOS7</string>
+          	<key>CFBundleIdentifier</key><string>com.nulldc.ios7</string>
+          	<key>CFBundlePackageType</key><string>APPL</string>
+          	<key>CFBundleShortVersionString</key><string>0.1.0</string>
+          	<key>CFBundleVersion</key><string>1</string>
+          	<key>MinimumOSVersion</key><string>7.0</string>
+          	<key>LSRequiresIPhoneOS</key><true/>
+          	<key>UIRequiredDeviceCapabilities</key>
+          	<array><string>armv7</string><string>opengles-2</string></array>
+          	<key>UISupportedInterfaceOrientations</key>
+          	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string><string>UIInterfaceOrientationPortrait</string></array>
+          	<key>UIStatusBarHidden</key><true/>
+          	<key>UIViewControllerBasedStatusBarAppearance</key><false/>
+          	<key>UIFileSharingEnabled</key><true/>
+          	<key>UIBackgroundModes</key><array/>
+          </dict>
+          </plist>
+          EOF_NDC
+          cat > 'control' <<'EOF_NDC'
+          Package: com.nulldc.ios7
+          Name: nullDC (iOS 7)
+          Version: 0.1.0
+          Architecture: iphoneos-arm
+          Description: Sega Dreamcast emulator (nullDC) for 32-bit iOS 7+, interpreter build
+          Maintainer: nulldc-ios7
+          Author: drk||Raziel, xiro, hlide (nullDC-PSP); iOS port
+          Section: Games
+          Depends: firmware (>= 7.0)
+          EOF_NDC
+          cat > 'ios/include/pspDmac.h' <<'EOF_NDC'
+          #pragma once
+          /* iOS stand-in for the PSP SDK header pspDmac.h (ios/ios_compat.h provides what is still used) */
+          EOF_NDC
+          cat > 'ios/include/pspdmac.h' <<'EOF_NDC'
+          #pragma once
+          /* iOS stand-in for the PSP SDK header pspdmac.h (ios/ios_compat.h provides what is still used) */
+          EOF_NDC
+          cat > 'ios/include/pspge.h' <<'EOF_NDC'
+          #pragma once
+          /* iOS stand-in for the PSP SDK header pspge.h (ios/ios_compat.h provides what is still used) */
+          EOF_NDC
+          cat > 'ios/include/pspkernel.h' <<'EOF_NDC'
+          #pragma once
+          /* iOS stand-in for the PSP SDK header pspkernel.h (ios/ios_compat.h provides what is still used) */
+          EOF_NDC
+          cat > /tmp/apply_ios.py <<'EOF_NDC'
+          import re, sys, os
+          root = os.getcwd()
+          def rd(p):
+              with open(os.path.join(root,p),"rb") as f: return f.read().decode("latin-1").replace("\r\n","\n")
+          def wr(p,s):
+              with open(os.path.join(root,p),"wb") as f: f.write(s.encode("latin-1"))
+          def sub(p, old, new, n=1):
+              s = rd(p)
+              assert s.count(old) >= 1, f"{p}: pattern not found: {old[:60]!r}"
+              s = s.replace(old, new, n)
+              wr(p, s)
+          def match_brace_end(s, start):
+              i = s.index("{", start); d = 0
+              while True:
+                  c = s[i]
+                  if c == "{": d += 1
+                  elif c == "}":
+                      d -= 1
+                      if d == 0: return i + 1
+                  i += 1
+
+          # ---- config.h --------------------------------------------------------------
+          _c = rd("config.h")
+          _c, n1 = re.subn(r"(#define OS_PS3\s+8\n)", r"\1#define OS_IOS      9\n", _c, count=1)
+          _c, n2 = re.subn(r"(#define SYS_PS3\s+6\n)", r"\1#define SYS_IOS\t\t\t7\n", _c, count=1)
+          assert n1 and n2
+          wr("config.h", _c)
+          sub("config.h", "#ifdef _WIN86\n", """#ifdef _IOS
+          	// iOS 7+ / armv7 (32-bit). No JIT on stock iOS -> SH4 interpreter only.
+          	#define _ARM
+          	#define HOST_CPU CPU_ARM_CORTEX_A8
+          	#define HOST_SYS SYS_IOS
+          	#define HOST_OS OS_IOS
+          	#define REND_API REND_GLES2
+          	#define VER_TARGET "ios/armv7"
+          	#define USE_INTERP 1
+          #endif
+
+          #ifdef _WIN86
+          """)
+
+          # ---- plugin_header.h -------------------------------------------------------
+          sub("plugins/plugin_header.h", "#elif HOST_OS==OS_PS2\n", """#elif HOST_OS==OS_IOS
+          	#include <stdint.h>
+          	#include <stddef.h>
+          	#include <string.h>
+          	typedef int8_t   s8;
+          	typedef int16_t  s16;
+          	typedef int32_t  s32;
+          	typedef int64_t  s64;
+          	typedef uint8_t  u8;
+          	typedef uint16_t u16;
+          	typedef uint32_t u32;
+          	typedef uint64_t u64;
+          	#define ALIGN(x) __attribute__((aligned(x)))
+          	#define FASTCALL
+          	#define fastcall
+          #elif HOST_OS==OS_PS2
+          """)
+
+          # ---- sh4_mem.cpp: VFPU memcpy -> plain memcpy on non-PSP -------------------
+          s = rd("dc/mem/sh4_mem.cpp")
+          i = s.index("void memcpy_vfpu( void* dst, const void* src, u32 size)")
+          j = match_brace_end(s, i)
+          s = (s[:i] + "#if HOST_OS!=OS_PSP\nvoid memcpy_vfpu( void* dst, const void* src, u32 size)\n{\n\tmemcpy(dst,src,size);\n}\n#else\n"
+               + s[i:j] + "\n#endif\n" + s[j:])
+          wr("dc/mem/sh4_mem.cpp", s)
+
+          # ---- threaded.cpp: VFPU TA push -------------------------------------------
+          s = rd("plugs/drkPvr/threaded.cpp")
+          i = s.index("#define vfpu_TADMA_cache_push(data)")
+          j = s.index("using namespace TASplitter;")
+          old = s[i:j]
+          new = ("#if HOST_OS==OS_PSP\n" + old +
+                 "#else\n#define vfpu_TADMA_cache_push(data) \\\n        { \\\n            const u32 idx = TA_cachedIndex; \\\n            memcpy(&TA_cached[idx], &data[0], 32); \\\n            TA_cachedIndex = (idx + 8) & TA_MAX_COUNT_MASK; \\\n        }\n#endif\n\n")
+          s = s[:i] + new + s[j:]
+          wr("plugs/drkPvr/threaded.cpp", s)
+
+          # ---- SPG.cpp: PSP profiler regs --------------------------------------------
+          s = rd("plugs/drkPvr/SPG.cpp")
+          i = s.index("#define PROFILER_REG_BASE")
+          j = s.index("u64 spg_last_vps=0;")
+          s = s[:i] + "#if HOST_OS==OS_PSP\n" + s[i:j] + "#endif\n\n" + s[j:]
+          wr("plugs/drkPvr/SPG.cpp", s)
+
+          # ---- SoundOut.cpp ----------------------------------------------------------
+          s = rd("dc/arm7/SoundOut.cpp")
+          s = s.replace("#include \"SoundOut.h\"\n#include <pspaudio.h>\n",
+           "#include \"SoundOut.h\"\n#if HOST_OS==OS_PSP\n#include <pspaudio.h>\n")
+          s += """
+          #else // HOST_OS != OS_PSP  -> iOS (AudioQueue ring buffer lives in ios/main.mm)
+          #include "ios/ios_host.h"
+          void PSP_InitAudio()  { ios_audio_init(); }
+          void PSP_TermAudio()  { }
+          void PSP_WriteSample(s16 r,s16 l) { ios_audio_write(r,l); }
+          #endif
+          """
+          wr("dc/arm7/SoundOut.cpp", s)
+
+          # ---- drkMapleDevices.cpp: PSP pad -> iOS touch pad -------------------------
+          s = rd("plugs/drkMapleDevices/drkMapleDevices.cpp")
+          i = s.index("#include <pspctrl.h>")
+          k = s.index("void UpdateInputState(u32 port)")
+          j = match_brace_end(s, k)
+          psp_part = s[i:j]
+          ios_part = """#include "ios/ios_host.h"
+
+          void UpdateInputState(u32 port)
+          {
+          	//kcode,rt,lt,joyx,joyy
+          	joyx[port]=0;
+          	joyy[port]=0;
+          	if (port==0)
+          		ios_input_poll(&kcode[0],&lt[0],&rt[0]);
+          	else
+          		kcode[port]=0xFFFF;
+          }"""
+          s = s[:i] + "#if HOST_OS==OS_PSP\n" + psp_part + "\n#else\n" + ios_part + "\n#endif" + s[j:]
+          wr("plugs/drkMapleDevices/drkMapleDevices.cpp", s)
+
+          # ---- glesRend.cpp: EAGL instead of EGL -------------------------------------
+          p = "plugs/drkPvr/glesRend.cpp"
+          sub(p, "#else\n#ifndef _ANDROID\n\t#include <EGL/egl.h>\n#endif\n\t#include <GLES2/gl2.h>\n#endif\n",
+          """#else
+          #if defined(_IOS)
+          	#include <OpenGLES/ES2/gl.h>
+          	#include <OpenGLES/ES2/glext.h>
+          	#include "ios/ios_host.h"
+          	//iOS: the host owns the EAGL context + CAEAGLLayer renderbuffer, exactly like the
+          	//_ANDROID path where the java side owns EGL. Reuse those guards, but keep the
+          	//emulation thread running and present from here.
+          	#define IOS_HOST_GL 1
+          	#define _ANDROID 1
+          #elif !defined(_ANDROID)
+          	#include <EGL/egl.h>
+          	#include <GLES2/gl2.h>
+          #else
+          	#include <GLES2/gl2.h>
+          #endif
+          #endif
+          """)
+          # declare SwapBuffersNow for iOS (the _ANDROID guard hides the normal decl)
+          sub(p, "#ifndef _ANDROID\nvoid SwapBuffersNow();\n#endif\n",
+                 "#if !defined(_ANDROID) || defined(IOS_HOST_GL)\nvoid SwapBuffersNow();\n#endif\n")
+          # present after DoRender
+          sub(p, "\tta_ctx.reset();\n\n#ifndef _ANDROID\n\tSwapBuffersNow();\n\tTestEGLError(\"DoRender\");\n#endif\n}",
+                 "\tta_ctx.reset();\n\n#if defined(IOS_HOST_GL)\n\tSwapBuffersNow();\n#elif !defined(_ANDROID)\n\tSwapBuffersNow();\n\tTestEGLError(\"DoRender\");\n#endif\n}")
+          # EndRender must not stop the CPU on iOS
+          sub(p, "void EndRender()\n{\n#ifdef _ANDROID\n\tsh4_cpu.Stop();\n#endif\n}",
+                 "void EndRender()\n{\n#if defined(_ANDROID) && !defined(IOS_HOST_GL)\n\tsh4_cpu.Stop();\n#endif\n}")
+          # SwapBuffersNow definition for iOS (before the EGL one)
+          sub(p, "#ifndef _ANDROID\nvoid SwapBuffersNow()\n{\n\teglSwapBuffers",
+                 "#if defined(IOS_HOST_GL)\nvoid SwapBuffersNow()\n{\n\tios_gl_present();\n}\n#elif !defined(_ANDROID)\nvoid SwapBuffersNow()\n{\n\teglSwapBuffers")
+          # InitRenderer: create the context on the emu thread
+          sub(p, "bool InitRenderer()\n{\n\n#ifndef _ANDROID\n\tif (!SetupEGL2()) goto cleanup;\n#endif",
+                 "bool InitRenderer()\n{\n\n#if defined(IOS_HOST_GL)\n\tif (!ios_gl_init()) goto cleanup;\n#elif !defined(_ANDROID)\n\tif (!SetupEGL2()) goto cleanup;\n#endif")
+
+
+          # ======== extra patches (second round) ========
+          c = rd("config.h")
+          c = c.replace("#define CPU_ARMV5\t7", "#define CPU_ARM_IOS 8\t\t//iOS armv7 (interpreter, generic C FPU helpers)\n#define CPU_ARMV5\t7", 1)
+          assert "CPU_ARM_IOS" in c
+          c = c.replace("\t#define HOST_CPU CPU_ARM_CORTEX_A8\n\t#define HOST_SYS SYS_IOS", "\t#define HOST_CPU CPU_ARM_IOS\n\t#define HOST_SYS SYS_IOS", 1)
+          assert "HOST_CPU CPU_ARM_IOS" in c
+          wr("config.h", c)
+          sub("plugins/plugin_header.h", "\t#define fastcall\n#elif HOST_OS==OS_PS2",
+              "\t#define fastcall\n\tstatic inline void __debugbreak(void) { __builtin_trap(); }\n#elif HOST_OS==OS_PS2")
+          sub("dc/arm7/vbaARM.h", '#include "plugins\\plugin_header.h"', '#include "plugins/plugin_header.h"')
+          t = rd("plugs/drkPvr/tex_decode.cpp")
+          old = "\t#ifndef _ANDROID\n\t\t#include <EGL/egl.h>\n\t#endif\n\t#include <GLES2/gl2.h>\n"
+          assert old in t
+          t = t.replace(old, "\t#if defined(_IOS)\n\t\t#include <OpenGLES/ES2/gl.h>\n\t\t#include <OpenGLES/ES2/glext.h>\n\t#else\n\t#ifndef _ANDROID\n\t\t#include <EGL/egl.h>\n\t#endif\n\t#include <GLES2/gl2.h>\n\t#endif\n", 1)
+          wr("plugs/drkPvr/tex_decode.cpp", t)
+          s = rd("dc/sh4/intc.cpp")
+          old = '\tu32 rv;\n\t asm ("clz %0,%1"\n             :"=r"(rv)        /* output */\n             :"r"(v)         /* input */\n\t\t\t );\n\t return 31-rv;'
+          assert old in s
+          s = s.replace(old, '\tu32 rv;\n#if HOST_OS==OS_PSP\n\t asm ("clz %0,%1"\n             :"=r"(rv)\n             :"r"(v)\n\t\t\t );\n#else\n\t rv=__builtin_clz(v);\n#endif\n\t return 31-rv;', 1)
+          wr("dc/sh4/intc.cpp", s)
+          s = rd("dc/sh4/sh4_registers.cpp")
+          i = s.index("INLINE void ChangeGPR()"); j = s.index("//called when sr is changed")
+          s = s[:i] + "#if HOST_OS==OS_PSP\n" + s[i:j] + """#else
+          INLINE void ChangeGPR() { for (int i=0;i<8;i++) { u32 t=r[i]; r[i]=r_bank[i]; r_bank[i]=t; } }
+          INLINE void ChangeFP()  { for (int i=0;i<16;i++) { u32 t=fr_hex[i]; fr_hex[i]=xf_hex[i]; xf_hex[i]=t; } }
+          #endif
+
+          """ + s[j:]
+          wr("dc/sh4/sh4_registers.cpp", s)
+
+          # ---- source list generated from psp/Makefile ----
+          mk = rd("psp/Makefile")
+          objs = re.findall(r"\.\./([\w/\.\-]+?)\.o\b", mk)
+          files = []
+          for o in objs:
+              if o.startswith("psp/") or o == "plugs/drkPvr/nullRend" or o in [x[:-4] if x.endswith(".cpp") else x[:-2] for x in files]: continue
+              for ext in (".cpp", ".c"):
+                  if os.path.exists(os.path.join(root, o + ext)):
+                      files.append(o + ext); break
+          files += ["plugs/drkPvr/glesRend.cpp", "plugs/drkPvr/tex_decode.cpp", "ios/ios_os.cpp", "ios/ngen_stub.cpp", "ios/main.mm"]
+          wr("ios/sources.mk", "NDC_SOURCES = \\\n" + " \\\n".join("\t" + x for x in files) + "\n")
+          print("sources:", len(files))
+
+          print("all patches applied")
+          EOF_NDC
+          python3 /tmp/apply_ios.py
+      - name: Install Theos + iOS toolchain
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential perl curl xz-utils bzip2 git fakeroot make zip
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/toolchain/linux/iphone" "$THEOS/sdks"
+          curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz" -o /tmp/tc.tar.xz
+          tar -xf /tmp/tc.tar.xz -C "$THEOS/toolchain"
+          curl -fsSL -o /tmp/sdk.tbz2 "https://raw.githubusercontent.com/Sn0wCooder/theos-sdks/master/iPhoneOS9.3.sdk.tbz2"
+          tar -xjf /tmp/sdk.tbz2 -C "$THEOS/sdks"
+          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
+          for fw in "$SDK"/System/Library/Frameworks/*.framework; do
+            if [ -f "$fw/module.map" ]; then mkdir -p "$fw/Modules"; mv "$fw/module.map" "$fw/Modules/module.modulemap"; fi
+          done
+          find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+      - name: Build
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          set -euo pipefail
+          echo "SDK libc++ headers:"; ls "$THEOS/sdks/iPhoneOS9.3.sdk/usr/include/c++/v1" | head -5 || echo MISSING
+          make package FINALPACKAGE=1 V=1 2>&1 | tee build.log
+          APP="$(find .theos -type d -name NullDCiOS7.app | head -n1)"
+          mkdir -p ipa/Payload packages
+          cp -a "$APP" ipa/Payload/
+          (cd ipa && zip -rq ../packages/NullDCiOS7.ipa Payload)
+          ls -la packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nulldc-ios7-armv7
+          path: packages/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
