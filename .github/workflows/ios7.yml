@@ -684,10 +684,14 @@ jobs:
 
           NDC_DEFS = -D_IOS -DRELEASE -DNO_MMU_TRACE
           NullDCiOS7_CFLAGS   = $(NDC_DEFS) -I. -Iios -Iios/include -include ios/ios_compat.h \
-                                -O3 -fno-strict-aliasing -fno-exceptions -fno-rtti -mfpu=neon -w
-          NullDCiOS7_CXXFLAGS = -std=gnu++11 -stdlib=libc++ -fno-exceptions -fno-rtti
+                                -O3 -fno-strict-aliasing -fno-exceptions -fno-rtti -mfpu=neon -fno-modules -w
+          # Toolchain is clang 19 whose bundled libc++ lacks __config_site and forces clang modules:
+          # use the iOS 9.3 SDK's own libc++ headers (matches the libc++.dylib on iOS 7) and no modules.
+          SDKINC = $(THEOS)/sdks/iPhoneOS9.3.sdk/usr/include/c++/v1
+          NullDCiOS7_USE_MODULES = 0
+          NullDCiOS7_CXXFLAGS = -std=gnu++11 -stdlib=libc++ -nostdinc++ -isystem $(SDKINC) -fno-modules -fno-cxx-modules -fno-exceptions -fno-rtti
           NullDCiOS7_OBJCFLAGS   = -fobjc-arc
-          NullDCiOS7_OBJCCFLAGS  = -fobjc-arc -std=gnu++11 -stdlib=libc++
+          NullDCiOS7_OBJCCFLAGS  = -fobjc-arc -std=gnu++11 -stdlib=libc++ -nostdinc++ -isystem $(SDKINC) -fno-modules -fno-cxx-modules
           NullDCiOS7_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore OpenGLES AudioToolbox AVFoundation
           NullDCiOS7_LDFLAGS    = -lz -stdlib=libc++
           NullDCiOS7_CODESIGN_FLAGS = -Sios/entitlements.plist
